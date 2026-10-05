@@ -1459,7 +1459,7 @@ class VersatileAttention(CrossAttentionMM):
 
     def set_scale_multiplier(self, multiplier: Union[float, None]):
         if multiplier is None or math.isclose(multiplier, 1.0):
-            self.scale = 1.0
+            self.scale = None
         else:
             self.scale = multiplier
 
