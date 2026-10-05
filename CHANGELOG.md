@@ -4,6 +4,20 @@ Changes in this fork relative to upstream [Kosinkadink/ComfyUI-AnimateDiff-Evolv
 
 Each entry says whether output changes. "Bit-identical" means a fixed-seed A/B produced `torch.equal` latents before and after the change.
 
+## 2026-10-05: window-safe FreeNoise for perfect loops
+
+### Add `FreeNoise (window-safe)` noise type
+- New option in every `noise_type` dropdown (Sample Settings and the noise layer nodes). The existing `FreeNoise` is unchanged.
+- **The problem:** FreeNoise builds noise by copying blocks forward from frame 0, which assumes context windows never move. Uniform context schedules shift the window phase every sampling step, and looped schedules wrap around the end, so windows end up holding the same noise frame twice. Duplicate noise pulls those frames toward the same image.
+  - On loops, the windows across the seam do this on every step, so motion stalls at the seam: in a 48-frame looped test, the last-to-first change was 0.32-0.44x the median frame-to-frame change, smaller than every other frame step.
+  - With standard uniform 16/8 at 669 frames, 734 of 913 windows (80%) held duplicate noise across 11 steps.
+- **The fix:** each frame draws its noise from a pool slightly larger than one window, chosen so no noise repeats within any window at any offset. When the context schedule is looped, this also holds across the loop seam. The first window keeps its own noise, as in FreeNoise.
+- **Measured:**
+  - 0 windows with duplicate noise across standard and looped schedules, 37 to 1046 frames, and overlaps 4 to 15.
+  - The same 48-frame loop's seam lands at 1.01-1.02x the median frame step, in the middle of the normal range.
+  - On a 48-frame 1456x768 vid2vid workflow, a flow-based flicker metric (warp error against the plate's optical flow) was unchanged (2.31 vs 2.31). Speed was unchanged.
+- Output: differs from FreeNoise by design. Existing `FreeNoise` and `default` noise renders were checked bit-identical before and after this change.
+
 ## 2026-10-05: views path cleanup
 
 ### Reduce memory and syncs in motion module views
