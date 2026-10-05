@@ -352,6 +352,13 @@ def get_context_windows(num_frames: int, opts: Union[ContextOptionsGroup, Contex
     return context_func(num_frames, opts)
 
 
+def get_window_index(idxs: list[int]) -> Union[slice, list[int]]:
+    # a contiguous window indexes as a slice (a view, no index tensor copied to the GPU); looped/strided windows keep list indexing
+    if idxs == list(range(idxs[0], idxs[0] + len(idxs))):
+        return slice(idxs[0], idxs[0] + len(idxs))
+    return idxs
+
+
 CONTEXT_MAPPING = {
     ContextSchedules.UNIFORM_LOOPED: create_windows_uniform_looped,
     ContextSchedules.UNIFORM_STANDARD: create_windows_uniform_standard,

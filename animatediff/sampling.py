@@ -23,7 +23,7 @@ import comfy.ops
 if hasattr(comfy, 'multigpu'):
     import comfy.multigpu
 
-from .context import ContextFuseMethod, ContextSchedules, get_context_weights, get_context_windows
+from .context import ContextFuseMethod, ContextSchedules, get_context_weights, get_context_windows, get_window_index
 from .context_extras import ContextRefHandler, NaiveReuseHandler
 from .sample_settings import SampleSettings, NoisedImageToInject
 from .utils_model import vae_encode_raw_batched, vae_decode_raw_batched
@@ -711,6 +711,7 @@ def prepare_control_objects(control: ControlBase, full_idxs: list[int], ADGS: An
 def get_resized_cond(cond_in, x_in: Tensor, full_idxs: list[int], context_length: int, ADGS: AnimateDiffGlobalState, device=None) -> list:
     if cond_in is None:
         return None
+    window_index = get_window_index(full_idxs)
     # reuse or resize cond items to match context requirements
     resized_cond = []
     # cond object is a list containing a dict - outer list is irrelevant, so just loop through it
@@ -724,7 +725,7 @@ def get_resized_cond(cond_in, x_in: Tensor, full_idxs: list[int], context_length
                     # check that tensor is the expected length - x.size(0)
                     if cond_item.size(0) == x_in.size(0):
                         # if so, it's subsetting time - tell controls the expected indeces so they can handle them
-                        actual_cond_item = cond_item[full_idxs]
+                        actual_cond_item = cond_item[window_index]
                         resized_actual_cond[key] = actual_cond_item.to(device)
                     else:
                         resized_actual_cond[key] = cond_item.to(device)
@@ -737,11 +738,11 @@ def get_resized_cond(cond_in, x_in: Tensor, full_idxs: list[int], context_length
                     for cond_key, cond_value in new_cond_item.items():
                         if isinstance(cond_value, Tensor):
                             if cond_value.size(0) == x_in.size(0):
-                                new_cond_item[cond_key] = cond_value[full_idxs].to(device)
+                                new_cond_item[cond_key] = cond_value[window_index].to(device)
                         # if has cond that is a Tensor, check if needs to be subset
                         elif hasattr(cond_value, "cond") and isinstance(cond_value.cond, Tensor):
                             if cond_value.cond.size(0) == x_in.size(0):
-                                new_cond_item[cond_key] = cond_value._copy_with(cond_value.cond[full_idxs].to(device))
+                                new_cond_item[cond_key] = cond_value._copy_with(cond_value.cond[window_index].to(device))
                         elif cond_key == "num_video_frames": # for SVD
                             new_cond_item[cond_key] = cond_value._copy_with(cond_value.cond)
                             new_cond_item[cond_key].cond = context_length
@@ -776,6 +777,11 @@ def sliding_calc_cond_batch(executor: Callable, model, conds: list[list[dict]], 
         # default counts_final initialization
         counts_final = [torch.zeros((x_in.shape[0], 1, 1, 1), device=x_in.device) for _ in conds]
     biases_final = [([0.0] * x_in.shape[0]) for _ in conds]
+    # build every window's fuse weights on the CPU and copy them to the GPU once per step, instead of syncing once per window
+    weights_final = None
+    if ADGS.params.context_options.fuse_method != ContextFuseMethod.RELATIVE:
+        weights_final = torch.cat([torch.Tensor(get_context_weights(len(ctx_idxs), x_in.shape[0], ctx_idxs, ADGS.params.context_options, sigma=timestep))
+                                   for ctx_idxs in context_windows]).to(device=x_in.device).split([len(ctx_idxs) for ctx_idxs in context_windows])
 
     CREF = ContextRefHandler()
     NAIVE = NaiveReuseHandler()
@@ -836,14 +842,14 @@ def sliding_calc_cond_batch(executor: Callable, model, conds: list[list[dict]], 
 
             for results in combined_results:
                 for result in results:
-                    combine_context_window_results(x_in, result.sub_conds_out, result.sub_conds, result.ctx_idxs, result.window_idx, len(enumerated_context_windows), timestep,
+                    combine_context_window_results(x_in, result.sub_conds_out, result.sub_conds, result.ctx_idxs, result.window_idx, len(enumerated_context_windows), weights_final,
                                                 ADGS, NAIVE, CREF, conds_final, counts_final, biases_final)
             
         else:
             for enum_window in enumerated_context_windows:
                 results = evaluate_context_windows(executor, model, x_in, conds, timestep, [enum_window], model_options, CREF, ADGS)
                 for result in results:
-                    combine_context_window_results(x_in, result.sub_conds_out, result.sub_conds, result.ctx_idxs, result.window_idx, len(enumerated_context_windows), timestep,
+                    combine_context_window_results(x_in, result.sub_conds_out, result.sub_conds, result.ctx_idxs, result.window_idx, len(enumerated_context_windows), weights_final,
                                                 ADGS, NAIVE, CREF, conds_final, counts_final, biases_final)
     finally:
         CREF.cleanup(model_options)
@@ -903,8 +909,9 @@ def evaluate_context_windows(executor, model: BaseModel, x_in: Tensor, conds, ti
         model_options["transformer_options"]["ad_params"]["sub_idxs"] = ctx_idxs
         model_options["transformer_options"]["ad_params"]["context_length"] = len(ctx_idxs)
         # get subsections of x, timestep, conds
-        sub_x = x_in[ctx_idxs].to(device)
-        sub_timestep = timestep[ctx_idxs].to(device)
+        window_index = get_window_index(ctx_idxs)
+        sub_x = x_in[window_index].to(device)
+        sub_timestep = timestep[window_index].to(device)
         sub_conds = [get_resized_cond(cond, x_in, ctx_idxs, len(ctx_idxs), ADGS, device) for cond in conds]
 
         CREF.prepare_referencecn(ctx_idxs, window_idx, model_options)
@@ -917,7 +924,7 @@ def evaluate_context_windows(executor, model: BaseModel, x_in: Tensor, conds, ti
     return results
 
 
-def combine_context_window_results(x_in: Tensor, sub_conds_out, sub_conds, ctx_idxs: list[int], window_idx: int, total_windows: int, timestep,
+def combine_context_window_results(x_in: Tensor, sub_conds_out, sub_conds, ctx_idxs: list[int], window_idx: int, total_windows: int, weights_final: tuple[Tensor],
                                    ADGS: AnimateDiffGlobalState, NAIVE: NaiveReuseHandler, CREF: ContextRefHandler,
                                    conds_final: list[Tensor], counts_final: list[Tensor], biases_final: list[Tensor]):
     if ADGS.params.context_options.fuse_method == ContextFuseMethod.RELATIVE:
@@ -934,11 +941,11 @@ def combine_context_window_results(x_in: Tensor, sub_conds_out, sub_conds, ctx_i
                 biases_final[i][idx] = bias_total + bias
     else:
         # add conds and counts based on weights of fuse method
-        weights = get_context_weights(len(ctx_idxs), x_in.shape[0], ctx_idxs, ADGS.params.context_options, sigma=timestep)
-        weights_tensor = torch.Tensor(weights).to(device=x_in.device).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        window_index = get_window_index(ctx_idxs)
+        weights_tensor = weights_final[window_idx].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
         for i in range(len(sub_conds_out)):
-            conds_final[i][ctx_idxs] += sub_conds_out[i] * weights_tensor
-            counts_final[i][ctx_idxs] += weights_tensor
+            conds_final[i][window_index] += sub_conds_out[i] * weights_tensor
+            counts_final[i][window_index] += weights_tensor
     # handle NaiveReuse
     NAIVE.cache_first_context_results(window_idx, ctx_idxs, sub_conds, conds_final, counts_final)
     # handle ContextRef
