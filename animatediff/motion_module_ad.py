@@ -19,7 +19,7 @@ import comfy.utils
 import comfy.ops
 import comfy.model_management
 
-from .context import ContextFuseMethod, ContextOptions, get_context_weights, get_context_windows
+from .context import ContextFuseMethod, ContextOptions, get_context_weights, get_context_windows, get_window_index
 from .adapter_animatelcm_i2v import AdapterEmbed
 if TYPE_CHECKING:  # avoids circular import
     from .adapter_cameractrl import CameraPoseEncoder
@@ -1349,18 +1349,21 @@ class TemporalTransformerBlock(nn.Module):
             views = get_context_windows(num_frames=video_length, opts=view_options)
             hidden_states = rearrange(hidden_states, "(b f) d c -> b f d c", f=video_length)
             value_final = torch.zeros_like(hidden_states)
-            count_final = torch.zeros_like(hidden_states)
-            batched_conds = hidden_states.size(1) // video_length
+            count_final = torch.zeros((1, video_length, 1, 1), dtype=hidden_states.dtype, device=hidden_states.device)
+            # build every view's fuse weights on the CPU and copy them to the GPU once, instead of syncing once per view
+            view_weights = torch.cat([torch.Tensor(get_context_weights(len(sub_idxs), video_length, sub_idxs, view_options, sigma=transformer_options["sigmas"]))
+                                      for sub_idxs in views]).to(device=hidden_states.device).split([len(sub_idxs) for sub_idxs in views])
             # store original camera_feature, if present
             has_camera_feature = False
             if mm_kwargs is not None:
                 has_camera_feature = True
                 orig_camera_feature = mm_kwargs["camera_feature"]
             # perform view options
-            for sub_idxs in views:
-                sub_hidden_states = rearrange(hidden_states[:, sub_idxs], "b f d c -> (b f) d c")
+            for sub_idxs, weights in zip(views, view_weights):
+                view_index = get_window_index(sub_idxs)
+                sub_hidden_states = rearrange(hidden_states[:, view_index], "b f d c -> (b f) d c")
                 if has_camera_feature:
-                    mm_kwargs["camera_feature"] = orig_camera_feature[:, sub_idxs, :]
+                    mm_kwargs["camera_feature"] = orig_camera_feature[:, view_index, :]
                 count = 0
                 for attention_block, norm, scale_mask in zip(self.attention_blocks, self.norms, scale_masks):
                     norm_hidden_states = norm(sub_hidden_states).to(sub_hidden_states.dtype)
@@ -1372,8 +1375,8 @@ class TemporalTransformerBlock(nn.Module):
                             else None,
                             attention_mask=attention_mask,
                             video_length=len(sub_idxs),
-                            scale_mask=scale_mask[:, sub_idxs, :] if scale_mask is not None else scale_mask,
-                            cameractrl_effect=cameractrl_effect[:, sub_idxs, :] if type(cameractrl_effect) == Tensor else cameractrl_effect,
+                            scale_mask=scale_mask[:, view_index, :] if scale_mask is not None else scale_mask,
+                            cameractrl_effect=cameractrl_effect[:, view_index, :] if type(cameractrl_effect) == Tensor else cameractrl_effect,
                             mm_kwargs=mm_kwargs,
                             transformer_options=transformer_options,
                         ) + sub_hidden_states
@@ -1381,10 +1384,9 @@ class TemporalTransformerBlock(nn.Module):
                     count += 1
                 sub_hidden_states = rearrange(sub_hidden_states, "(b f) d c -> b f d c", f=len(sub_idxs))
 
-                weights = get_context_weights(len(sub_idxs), video_length, sub_idxs, view_options, sigma=transformer_options["sigmas"]) * batched_conds
-                weights_tensor = torch.Tensor(weights).to(device=hidden_states.device).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                value_final[:, sub_idxs] += sub_hidden_states * weights_tensor
-                count_final[:, sub_idxs] += weights_tensor
+                weights_tensor = weights.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                value_final[:, view_index] += sub_hidden_states * weights_tensor
+                count_final[:, view_index] += weights_tensor
             # restore original camera_feature
             if has_camera_feature:
                 mm_kwargs["camera_feature"] = orig_camera_feature

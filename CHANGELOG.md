@@ -4,6 +4,15 @@ Changes in this fork relative to upstream [Kosinkadink/ComfyUI-AnimateDiff-Evolv
 
 Each entry says whether output changes. "Bit-identical" means a fixed-seed A/B produced `torch.equal` latents before and after the change.
 
+## 2026-10-05: views path cleanup
+
+### Reduce memory and syncs in motion module views
+- Only affects workflows that plug view options into a context options node (sliding views inside the motion modules).
+- The views path kept a full-size count tensor (frames x tokens x channels) that only ever held one weight per frame. It is now `(1, frames, 1, 1)` and broadcasts in the final division, which saves about 700 MB per top-level motion module call at 1456x768.
+- Contiguous views index with slices instead of Python lists, and all view weights for a call are copied to the GPU once instead of once per view.
+- Measured with the same workflow at 96 frames, context 32/8 with views 16/8: pass 1 went from 25.90 to 24.75 s/step (-4.4%), pass 2 from 29.08 to 27.86 s/step (-4.2%), and peak VRAM from 19.2 to 18.8 GB.
+- Output: bit-identical.
+
 ## 2026-10-04: context window loop cleanup
 
 The three changes below were measured together on an RTX 4090 (ComfyUI 0.38.2, PyTorch 2.7.1+cu128). The test was a fixed-seed 48-frame cut of a two-pass SD1.5 vid2vid workflow at 1456x768 (v3_sd15_mm, uniform context 16/1/8 pyramid, FreeNoise, two SamplerCustom passes with ControlNet and IPAdapter), averaged over three warm runs each:
