@@ -25,6 +25,8 @@ The three changes below were measured together on an RTX 4090 (ComfyUI 0.38.2, P
 
 All latents were bit-identical to the unmodified code.
 
+The changes were also checked on a second workflow: legacy `ADE_AnimateDiffLoaderWithContext` with motion scale 1.1, looped uniform context 16/1/4 (some windows wrap and keep list indexing), a motion LoRA, IPAdapterTiled, and two Efficient KSampler passes at 768x432, 48 frames. Latents were bit-identical, and speed was unchanged within 0.5%: the gain depends on how much per-window overhead a workflow has.
+
 ### Remove CPU-GPU syncs from the context window loop
 - Contiguous context windows index `x`, timesteps and conds with a slice (a view) instead of a Python list. List indexing copies an index tensor to the GPU and forces a sync. Looped windows that wrap around and strided windows still use list indexing.
 - Fuse weights for all windows are built on the CPU and copied to the GPU once per step instead of once per window.
