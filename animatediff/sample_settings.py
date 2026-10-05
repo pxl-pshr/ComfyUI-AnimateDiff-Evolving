@@ -16,7 +16,7 @@ from comfy.model_base import BaseModel
 from comfy.sd import VAE
 
 from . import freeinit
-from .context import ContextOptions, ContextOptionsGroup
+from .context import ContextOptions, ContextOptionsGroup, ContextSchedules
 from .utils_model import SigmaSchedule, BIGMAX_TENSOR
 from .utils_motion import extend_to_batch_size, get_sorted_list_via_attr, prepare_mask_batch
 from .logger import logger
@@ -45,8 +45,9 @@ class NoiseLayerType:
     EMPTY = "empty"
     REPEATED_CONTEXT = "repeated_context"
     FREENOISE = "FreeNoise"
+    FREENOISE_WINDOW_SAFE = "FreeNoise (window-safe)"
 
-    LIST = [DEFAULT, CONSTANT, EMPTY, REPEATED_CONTEXT, FREENOISE]
+    LIST = [DEFAULT, CONSTANT, EMPTY, REPEATED_CONTEXT, FREENOISE, FREENOISE_WINDOW_SAFE]
     LIST_ANCESTRAL = [DEFAULT, CONSTANT]
 
 
@@ -501,10 +502,72 @@ class SeedNoiseGeneration:
             noise[place_idx:place_idx+delta] = noise[list_idx]
         return noise
 
+    @staticmethod
+    def _convert_to_freenoise_window_safe(noise: Tensor, seed: int, extra_args: dict, device=RandDevice.CPU, **kwargs):
+        # FreeNoise reuses noise so windows share it, but its block copies assume windows never move; uniform schedules shift
+        # windows every step (and looped ones wrap), so windows end up holding the same noise twice. Here every frame draws from
+        # a pool slightly larger than one window, and no noise repeats within any window start or across the loop seam.
+        opts: ContextOptionsGroup = extra_args["context_options"]
+        context_length: int = opts.context_length if not opts.view_options else opts.view_options.context_length
+        context_overlap: int = opts.context_overlap if not opts.view_options else opts.view_options.context_overlap
+        video_length: int = noise.shape[0]
+        if context_length is None or video_length <= context_length:
+            return noise
+        looped = opts.context_schedule == ContextSchedules.UNIFORM_LOOPED
+        generator, _ = get_generator(RandDevice.CPU, seed)
+        pool_size = context_length + max(context_length - context_overlap, 1) - 1
+        if looped:
+            # closing the loop needs at least ceil(frames / floor(frames / length)) distinct noises; start with some slack above it
+            pool_size = max(pool_size, -(-video_length // (video_length // context_length)) + 2)
+        while pool_size < video_length:
+            order = get_window_safe_noise_order(video_length, context_length, pool_size, looped, generator)
+            if order is not None:
+                return noise[:pool_size][order]
+            pool_size += 1
+        # a pool as large as the video means no frame needs to reuse noise
+        return noise
+
+
+def get_window_safe_noise_order(frames: int, length: int, pool_size: int, looped: bool, generator: torch.Generator):
+    '''Pick a pool index per frame so no index repeats within `length` consecutive frames (cyclically when looped).
+    The first window keeps its own noise. Returns None if the search budget runs out.'''
+    order = list(range(length)) + [-1] * (frames - length)
+    budget = 20 * frames
+
+    def is_free(t: int, idx: int):
+        for d in range(1, length):
+            if (looped or t - d >= 0) and order[(t - d) % frames] == idx:
+                return False
+            if looped and order[(t + d) % frames] == idx:
+                return False
+        return True
+
+    # forward search with backtracking; only the wrap around the loop seam can force a backtrack
+    choices: list[Union[list[int], None]] = [None] * frames
+    t = length
+    while t < frames:
+        if choices[t] is None:
+            free = [idx for idx in range(pool_size) if is_free(t, idx)]
+            choices[t] = [free[i] for i in torch.randperm(len(free), generator=generator).tolist()]
+        if choices[t]:
+            order[t] = choices[t].pop()
+            t += 1
+        else:
+            choices[t] = None
+            t -= 1
+            order[t] = -1
+            if t < length:
+                return None
+        budget -= 1
+        if budget <= 0:
+            return None
+    return order
+
 
 DERIVATIVE_NOISE_FUNC_MAP = {
     NoiseLayerType.REPEATED_CONTEXT: SeedNoiseGeneration._convert_to_repeated_context,
     NoiseLayerType.FREENOISE: SeedNoiseGeneration._convert_to_freenoise,
+    NoiseLayerType.FREENOISE_WINDOW_SAFE: SeedNoiseGeneration._convert_to_freenoise_window_safe,
     }
 
 
