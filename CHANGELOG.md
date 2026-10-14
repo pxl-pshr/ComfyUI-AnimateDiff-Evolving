@@ -14,6 +14,10 @@ A multi-agent review of everything above, run on CPU against upstream, confirmed
 - Measured: 0 views with duplicate noise across 288 combinations (standard, looped, static and Views Only outer contexts, with static, standard and looped views, 48 to 669 frames). Before the fix, Views Only with looped 16/4 views at 96 frames had 20 of 160 views holding duplicate noise.
 - Output: changes only for `FreeNoise (window-safe)` with looped view options.
 
+### Clear error when context or view options give no windows
+- With overlap larger than length at stride 1, the window builders return no windows. Upstream then sampled to an all-NaN result. Since the context loop and views changes above, the fork instead stopped with an unclear `torch.cat` error. It now stops with "overlap must be smaller than length".
+- Output: unchanged for every setting that produces windows.
+
 ## 2026-10-05: window-safe FreeNoise for perfect loops
 
 ### Add `FreeNoise (window-safe)` noise type

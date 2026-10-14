@@ -349,7 +349,10 @@ def get_context_windows(num_frames: int, opts: Union[ContextOptionsGroup, Contex
     context_func = CONTEXT_MAPPING.get(opts.context_schedule, None)
     if not context_func:
         raise ValueError(f"Unknown context_schedule '{opts.context_schedule}'.")
-    return context_func(num_frames, opts)
+    windows = context_func(num_frames, opts)
+    if not windows:
+        raise ValueError(f"Context/view options give no windows for {num_frames} frames: overlap ({opts.context_overlap}) must be smaller than length ({opts.context_length}).")
+    return windows
 
 
 def get_window_index(idxs: list[int]) -> Union[slice, list[int]]:
