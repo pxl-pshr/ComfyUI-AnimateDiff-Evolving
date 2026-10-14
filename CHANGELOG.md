@@ -4,6 +4,16 @@ Changes in this fork relative to upstream [Kosinkadink/ComfyUI-AnimateDiff-Evolv
 
 Each entry says whether output changes. "Bit-identical" means a fixed-seed A/B produced `torch.equal` latents before and after the change.
 
+## 2026-10-13: fixes from a review of the fork
+
+A multi-agent review of everything above, run on CPU against upstream, confirmed that the production setups are bit-identical end to end. That covers standard 16/1/8 and looped 16/1/4 context with FreeNoise, Advanced-ControlNet, IPAdapter (including Tiled and per-frame weights) and two sampler passes. It also found the issues fixed below.
+
+### Fix window-safe FreeNoise with looped view options
+- Window-safe noise took the loop setting from the outer context only, so looped views still held duplicate noise where they wrap. With `Context Options◆Views Only` that happens at the video's loop seam. With looped views under another context schedule, it happens inside every outer window, because the views wrap within it.
+- Now Views Only with looped views is treated as looped over the whole video. Looped views under an outer context keep noise unique across each whole outer window, since any two of its frames can share a view.
+- Measured: 0 views with duplicate noise across 288 combinations (standard, looped, static and Views Only outer contexts, with static, standard and looped views, 48 to 669 frames). Before the fix, Views Only with looped 16/4 views at 96 frames had 20 of 160 views holding duplicate noise.
+- Output: changes only for `FreeNoise (window-safe)` with looped view options.
+
 ## 2026-10-05: window-safe FreeNoise for perfect loops
 
 ### Add `FreeNoise (window-safe)` noise type

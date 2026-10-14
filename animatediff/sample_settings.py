@@ -506,14 +506,25 @@ class SeedNoiseGeneration:
     def _convert_to_freenoise_window_safe(noise: Tensor, seed: int, extra_args: dict, device=RandDevice.CPU, **kwargs):
         # FreeNoise reuses noise so windows share it, but its block copies assume windows never move; uniform schedules shift
         # windows every step (and looped ones wrap), so windows end up holding the same noise twice. Here every frame draws from
-        # a pool slightly larger than one window, and no noise repeats within any window start or across the loop seam.
+        # a pool slightly larger than one window, and no noise repeats within `length` consecutive frames (cyclically when the
+        # windows wrap), which covers every stride-1 window at any offset. Strided windows span more frames and can still repeat.
         opts: ContextOptionsGroup = extra_args["context_options"]
-        context_length: int = opts.context_length if not opts.view_options else opts.view_options.context_length
-        context_overlap: int = opts.context_overlap if not opts.view_options else opts.view_options.context_overlap
+        views = opts.view_options
+        looped = opts.context_schedule == ContextSchedules.UNIFORM_LOOPED
+        if views is None:
+            context_length, context_overlap = opts.context_length, opts.context_overlap
+        elif views.context_schedule != ContextSchedules.UNIFORM_LOOPED:
+            # views are consecutive frames of an outer window, so only a looped outer schedule makes them wrap
+            context_length, context_overlap = views.context_length, views.context_overlap
+        elif opts.context_schedule == ContextSchedules.VIEW_AS_CONTEXT:
+            # looped views over the whole video wrap at the loop seam
+            context_length, context_overlap, looped = views.context_length, views.context_overlap, True
+        else:
+            # looped views wrap inside each outer window, so any two frames of an outer window can share a view
+            context_length, context_overlap = opts.context_length, opts.context_overlap
         video_length: int = noise.shape[0]
         if context_length is None or video_length <= context_length:
             return noise
-        looped = opts.context_schedule == ContextSchedules.UNIFORM_LOOPED
         generator, _ = get_generator(RandDevice.CPU, seed)
         pool_size = context_length + max(context_length - context_overlap, 1) - 1
         if looped:
