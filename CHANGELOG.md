@@ -18,6 +18,13 @@ A multi-agent review of everything above, run on CPU against upstream, confirmed
 - With overlap larger than length at stride 1, the window builders return no windows. Upstream then sampled to an all-NaN result. Since the context loop and views changes above, the fork instead stopped with an unclear `torch.cat` error. It now stops with "overlap must be smaller than length".
 - Output: unchanged for every setting that produces windows.
 
+### Known limitation: slow noise setup at very high overlap on looped contexts
+- On looped schedules, the window-safe noise search can backtrack at high overlap: 32/1/31 at 1046 frames takes about 16 s and 64/1/63 about 100 s before each sampler pass. Looped 16/1/4 and standard 16/1/8 take under 0.06 s at any length up to 1100 frames.
+
+### Changelog corrections
+- The window-safe FreeNoise guarantee holds for stride-1 windows; the entry below now says so.
+- The views count-tensor saving is about 360 MB per call at the measured setup, not 700 MB. That matches the measured 0.4 GB drop in peak VRAM.
+
 ## 2026-10-05: window-safe FreeNoise for perfect loops
 
 ### Add `FreeNoise (window-safe)` noise type
@@ -25,9 +32,9 @@ A multi-agent review of everything above, run on CPU against upstream, confirmed
 - **The problem:** FreeNoise builds noise by copying blocks forward from frame 0, which assumes context windows never move. Uniform context schedules shift the window phase every sampling step, and looped schedules wrap around the end, so windows end up holding the same noise frame twice. Duplicate noise pulls those frames toward the same image.
   - On loops, the windows across the seam do this on every step, so motion stalls at the seam: in a 48-frame looped test, the last-to-first change was 0.32-0.44x the median frame-to-frame change, smaller than every other frame step.
   - With standard uniform 16/8 at 669 frames, 734 of 913 windows (80%) held duplicate noise across 11 steps.
-- **The fix:** each frame draws its noise from a pool slightly larger than one window, chosen so no noise repeats within any window at any offset. When the context schedule is looped, this also holds across the loop seam. The first window keeps its own noise, as in FreeNoise.
+- **The fix:** each frame draws its noise from a pool slightly larger than one window, chosen so no noise repeats within any stride-1 window at any offset. When the context schedule is looped, this also holds across the loop seam. The first window keeps its own noise, as in FreeNoise. With `context_stride` 2 or more, the strided windows span more frames and can still hold repeated noise, though less often than with FreeNoise.
 - **Measured:**
-  - 0 windows with duplicate noise across standard and looped schedules, 37 to 1046 frames, and overlaps 4 to 15.
+  - 0 windows with duplicate noise across standard and looped schedules at stride 1, 37 to 1046 frames, and overlaps 4 to 15.
   - The same 48-frame loop's seam lands at 1.01-1.02x the median frame step, in the middle of the normal range.
   - On a 48-frame 1456x768 vid2vid workflow, a flow-based flicker metric (warp error against the plate's optical flow) was unchanged (2.31 vs 2.31). Speed was unchanged.
 - Output: differs from FreeNoise by design. Existing `FreeNoise` and `default` noise renders were checked bit-identical before and after this change.
@@ -36,7 +43,7 @@ A multi-agent review of everything above, run on CPU against upstream, confirmed
 
 ### Reduce memory and syncs in motion module views
 - Only affects workflows that plug view options into a context options node (sliding views inside the motion modules).
-- The views path kept a full-size count tensor (frames x tokens x channels) that only ever held one weight per frame. It is now `(1, frames, 1, 1)` and broadcasts in the final division, which saves about 700 MB per top-level motion module call at 1456x768.
+- The views path kept a full-size count tensor (frames x tokens x channels) that only ever held one weight per frame. It is now `(1, frames, 1, 1)` and broadcasts in the final division, which saves about 360 MB per top-level motion module call at 1456x768 with 32-frame windows.
 - Contiguous views index with slices instead of Python lists, and all view weights for a call are copied to the GPU once instead of once per view.
 - Measured with the same workflow at 96 frames, context 32/8 with views 16/8: pass 1 went from 25.90 to 24.75 s/step (-4.4%), pass 2 from 29.08 to 27.86 s/step (-4.2%), and peak VRAM from 19.2 to 18.8 GB.
 - Output: bit-identical.
